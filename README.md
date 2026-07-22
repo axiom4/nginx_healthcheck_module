@@ -1,4 +1,4 @@
-# ngx_http_upstream_healthcheck_module
+# Nginx HTTP Healthcheck Module
 
 Active health checks for nginx open source. No patch to the nginx source required: the module hooks into the load-balancing chain (round robin, least_conn, ...) by wrapping `peer.init` / `peer.get` / `peer.free`.
 
