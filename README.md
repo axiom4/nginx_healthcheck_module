@@ -2,7 +2,7 @@
 
 Active health checks for nginx open source. No patch to the nginx source required: the module hooks into the load-balancing chain (round robin, least_conn, ...) by wrapping `peer.init` / `peer.get` / `peer.free`.
 
-Tested with nginx 1.26.2.
+Tested with Ubuntu 26/04 and nginx 1.28.3.
 
 ## Features
 
@@ -19,26 +19,92 @@ Tested with nginx 1.26.2.
 - Plain-text status page (`healthcheck_status`)
 - UP/DOWN transitions logged at `warn` level in the error log
 
-## Build
+## Installation
+
+### Using the bundled Makefile (recommended)
 
 ```sh
-# requires --with-http_ssl_module if you want to use "ssl" in the healthcheck directive
-./configure --with-http_ssl_module --add-module=/path/to/ngx_healthcheck [other options...]
-make && make install
+git clone <this-repo-url> ngx_http_upstream_healthcheck_module
+cd ngx_http_upstream_healthcheck_module
+make
 ```
 
-Also works as a dynamic module:
+`make` auto-detects the nginx already installed on the system (version and
+build options, via `nginx -V`, whichever way it got there: apt, dnf, brew,
+a manual build), downloads a matching nginx source tree once (cached in
+`build/`, untouched by subsequent builds), compiles the module as a dynamic
+module against it, and copies the result to
+`dist/ngx_http_upstream_healthcheck_module.so`.
+
+Then load it in your `nginx.conf`, at the very top (before `events {}`):
+
+```nginx
+load_module /path/to/dist/ngx_http_upstream_healthcheck_module.so;
+```
+
+and reload:
 
 ```sh
-./configure --with-http_ssl_module --add-dynamic-module=/path/to/ngx_healthcheck
-make modules
-# then in nginx.conf:
-# load_module modules/ngx_http_upstream_healthcheck_module.so;
+sudo nginx -t && sudo nginx -s reload
 ```
 
-Body matching requires PCRE to be built in (included automatically unless you use `--without-http_rewrite_module`, which excludes it).
+See `make help` for the other targets (`test`, `clean`, `distclean`).
 
-With the bundled Makefile, `make` already builds with `--with-http_ssl_module` by default.
+## Integration example
+
+A minimal but complete `nginx.conf` wiring the module into a real reverse
+proxy: two backends, an HTTP health probe with body matching, and a status
+page.
+
+```nginx
+load_module /opt/nginx-modules/ngx_http_upstream_healthcheck_module.so;
+
+worker_processes auto;
+events { worker_connections 1024; }
+
+http {
+    healthcheck_match ok {
+        status 200-299;
+        body ~ "\"status\"\s*:\s*\"ok\"";
+    }
+
+    upstream backend {
+        server 10.0.0.1:8080;
+        server 10.0.0.2:8080;
+
+        healthcheck interval=5000 timeout=2000 fall=3 rise=2
+                    uri=/health match=ok;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass http://backend;
+        }
+
+        location /hc-status {
+            healthcheck_status;
+        }
+    }
+}
+```
+
+Start (or reload) nginx, then:
+
+```sh
+curl http://127.0.0.1/hc-status
+```
+```
+upstream healthcheck status
+---------------------------
+backend  peer=10.0.0.1:8080  status=up  fails=0  last_fails=0
+backend  peer=10.0.0.2:8080  status=up  fails=0  last_fails=0
+```
+
+If a backend goes down, `fall=3` consecutive failed probes mark it DOWN and
+nginx stops routing traffic to it; `rise=2` consecutive successes bring it
+back once it recovers — no reload needed either way.
 
 ## Configuration
 
@@ -259,125 +325,16 @@ directive, because the zone is created at the first occurrence of
 `healthcheck` encountered while parsing; if it appears after, parsing fails
 with an explicit error instead of being silently ignored.
 
-## Architecture (in brief)
-
-1. **Parse config** — the `healthcheck` directive registers a shm zone
-   (default size 128 KB, or whatever `healthcheck_shm_size` gave if it
-   precedes the directive) and replaces `uscf->peer.init_upstream` with its
-   own wrapper, saving the original. `healthcheck_match` uses nginx's
-   standard technique for custom blocks (`cf->handler`/`cf->handler_conf`,
-   the same one `types { }` uses in the core).
-2. **Init upstream** — the wrapper calls the original init (round robin by
-   default), resolves `match=NAME` to the matching `healthcheck_match` block,
-   creates the SSL client context (`ngx_ssl_create` with `NGX_SSL_CLIENT`) if
-   `ssl` is active; if `resolve` is active, it checks that the upstream has
-   `zone` (otherwise a config error) and, for every peer with a hostname (not
-   a literal IP) in the original text of `server`, extracts host and port for
-   periodic re-resolution. It then enumerates the peers and registers them in
-   a global array (each entry also carries a pointer to the srv_conf of the
-   upstream it belongs to, used later to isolate state between different
-   upstreams, and pointers to the peer's round-robin structures, used by
-   `resolve`'s lock); it also replaces `us->peer.init`.
-3. **Init shm zone** — allocates an array of states (`down`, fall/rise
-   counters, stats, plus an `ngx_rwlock` per entry) in the zone's slab; on
-   reload it copies the previous state if the number of peers matches.
-4. **Worker 0** — in `init_process` it arms a timer per peer (with a random
-   initial offset to spread out the probes). On each expiry: if `keepalive`
-   is active and the previous cycle left an open, idle connection, it's
-   reused directly (moving straight to sending the request); otherwise
-   `ngx_event_connect_peer` → (if `ssl`, asynchronous TLS handshake with
-   `ngx_ssl_handshake`, the same mechanism `proxy_pass` uses toward an https
-   backend, replaying the TLS session cached from the previous cycle to
-   shorten the handshake, and optional hostname verification via
-   `ngx_ssl_check_host`) → send GET → read the response, which with
-   `keepalive` stops as soon as headers + `Content-Length` have been fully
-   received instead of waiting for the connection to close → evaluate
-   against the match (status range + body regex) → update counters/flags in
-   shm under `ngx_rwlock_wlock`. At the end of the cycle: with `keepalive`
-   and a response correctly framed via `Content-Length` (and without
-   `Connection: close`), the connection stays open with a dedicated handler
-   that closes it if the backend interrupts it while idle; otherwise (or
-   without `keepalive`) the connection is closed and, if `ssl`, the
-   negotiated TLS session is saved for the next (new) handshake.
-5. **Request time** — the wrapped `peer.get` calls the original get and, if
-   the returned peer is marked down in shm (read under `ngx_rwlock_rlock`,
-   and only among entries of the same upstream), discards it with
-   `free(NGX_PEER_FAILED)` and retries, up to `NGX_BUSY` if none are left.
-6. **Worker 0, re-resolution** — if `resolve` is active, a second per-peer
-   timer (independent of the probe one) invokes `ngx_resolve_start`/
-   `ngx_resolve_name` on the original hostname. On response, among the
-   returned addresses the first one of the same family as the peer's current
-   one is chosen; if different, only the address bytes (not the whole
-   struct, not a pointer) are overwritten in place under the round-robin
-   peer's lock (`ngx_http_upstream_rr_peer_lock`) — since that memory lives
-   in the `zone`'s shm, every worker sees it updated immediately, with no
-   need to propagate it explicitly. A resolution failure (timeout, NXDOMAIN)
-   simply leaves the last known address in use.
-
 ## Known limitations
 
 - Doesn't support dynamically adding/removing peers from an upstream: nginx
   open source offers no native mechanism to change the *number* of backends
   without `nginx -s reload` (that remains a limitation of the OSS platform,
-  not of this module). What **is** supported, via `resolve` (see above and
-  the "Resolved limitations" section), is following the *address* change of
-  an already-existing peer when it's configured with a hostname instead of a
-  literal IP — the most common practical case of a "dynamic upstream"
-  (a backend behind a cloud load balancer, a k8s service, etc.).
-
-### Limitations resolved in this revision
-
-- **Isolation between different upstreams**: a peer's state is now keyed on
-  `(upstream, sockaddr)` instead of just sockaddr, so two different upstreams
-  with the same ip:port no longer share health state.
-- **Synchronization of state in shm**: every entry has its own `ngx_rwlock`
-  (the same primitive nginx's core uses for shared upstream state); readers
-  (peer selection, status page) and the writer (worker 0) are now formally
-  synchronized.
-- **TLS hostname verification**: with `ssl_verify=on` and `ssl_name=` set,
-  besides chain verification it's also checked that the backend's
-  certificate actually covers that hostname (via `ngx_ssl_check_host`, the
-  same mechanism `proxy_pass` uses toward an https upstream). Without
-  `ssl_name` there's no meaningful hostname to check against (the peer is
-  identified by ip:port) and only chain verification is done, as before.
-- **TLS session resumption**: when `keepalive` is absent, the session
-  negotiated by an `ssl` probe is cached per-peer (in worker 0's memory, not
-  in shm) and replayed on the next cycle via `SSL_set_session`; if the
-  backend accepts it, the next handshake is abbreviated instead of full.
-  With `keepalive` this isn't even needed: there's no new handshake at all,
-  because it's the same TLS connection that stays open.
-- **Resizable shm zone**: no longer fixed at 128 KB; the new
-  `healthcheck_shm_size` directive lets you grow it for upstreams with many
-  peers. It must precede any `healthcheck` directive in the config file,
-  because the zone is created at the first occurrence encountered while
-  parsing.
-- **Reusing the TCP connection between one cycle and the next**: with the
-  new `keepalive` directive, the probe sends `Connection: keep-alive` and,
-  if the backend responds with an explicit `Content-Length` and without
-  `Connection: close`, the connection (TCP and, with `ssl`, TLS too) stays
-  open and is reused on the next cycle — no new connect, no new handshake. A
-  dedicated handler watches the connection while it's idle: if the backend
-  closes it anyway (idle timeout, restart, etc.) the module notices and
-  reconnects from scratch on the next probe, marking that single cycle as
-  failed if needed but without requiring manual intervention. It remains
-  opt-in (default `off`) because it changes the probe's semantics: a backend
-  that's down only on the connect path (closed port, firewall) may stay
-  temporarily invisible until the reused connection is actually closed by
-  someone.
-- **DNS re-resolution of peers** (`resolve` + `healthcheck_resolver`): a peer
-  configured with a hostname is periodically re-resolved (every 30s by
-  default, `resolve_interval=`) using `ngx_resolver`, the same asynchronous
-  resolver used for `proxy_pass` toward a variable name. If the address
-  changes, it's updated **in place** in the upstream's shared memory (hence
-  the `zone` requirement), visible to every worker the instant it happens —
-  without reallocating or moving pointers, so as not to reintroduce the
-  cross-worker visibility problem `zone` solves. It doesn't add/remove peers
-  (that limitation remains, see above): a `server` still amounts to one
-  fixed slot, re-resolution only updates its contents. Verified end-to-end
-  with a test DNS resolver: a peer goes from UP to DOWN and back exactly
-  following the address change returned by DNS, including the safe fallback
-  when the new answer is of a different family (IPv4/IPv6) than the peer's
-  original one.
+  not of this module). What **is** supported, via `resolve`, is following
+  the *address* change of an already-existing peer when it's configured
+  with a hostname instead of a literal IP — the most common practical case
+  of a "dynamic upstream" (a backend behind a cloud load balancer, a k8s
+  service, etc.).
 
 ## Quick test (plain HTTP)
 
@@ -427,3 +384,7 @@ upstream backend {
 ```
 
 `curl http://.../hc-status` should show `status=up` for peer 9201.
+
+## License
+
+BSD-2-Clause. See [LICENSE](LICENSE).
