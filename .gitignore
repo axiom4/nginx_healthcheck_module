@@ -1,1 +1,8 @@
 build
+*.log
+test/*.pid
+test/client_body_temp/
+test/proxy_temp/
+test/tmp/
+dist
+__pycache__

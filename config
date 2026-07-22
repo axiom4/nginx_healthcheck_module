@@ -1,11 +1,20 @@
 ngx_addon_name=ngx_http_upstream_healthcheck_module
 
+ngx_hc_srcs="$ngx_addon_dir/src/ngx_http_upstream_healthcheck_module.c \
+             $ngx_addon_dir/src/ngx_http_hc_upstream.c \
+             $ngx_addon_dir/src/ngx_http_hc_balancer.c \
+             $ngx_addon_dir/src/ngx_http_hc_probe.c \
+             $ngx_addon_dir/src/ngx_http_hc_resolve.c \
+             $ngx_addon_dir/src/ngx_http_hc_status.c"
+
 if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_upstream_healthcheck_module
-    ngx_module_srcs="$ngx_addon_dir/ngx_http_upstream_healthcheck_module.c"
+    ngx_module_srcs="$ngx_hc_srcs"
+    ngx_module_incs="$ngx_addon_dir/include"
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_upstream_healthcheck_module"
-    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_upstream_healthcheck_module.c"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_hc_srcs"
+    CORE_INCS="$CORE_INCS $ngx_addon_dir/include"
 fi

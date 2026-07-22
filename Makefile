@@ -1,153 +1,147 @@
-# Makefile per ngx_http_upstream_healthcheck_module
+# Makefile for ngx_http_upstream_healthcheck_module
 #
-# I moduli nginx si compilano tramite il configure di nginx stesso, quindi
-# questo Makefile automatizza l'intero flusso: scarica il sorgente nginx,
-# lo configura con il modulo e compila.
+# nginx modules are compiled through nginx's own configure script, so this
+# Makefile automates the whole flow: fetch the nginx source, configure it
+# with the module and build.
 #
-# Uso tipico:
-#   make                # build statica (binario nginx completo in build/)
-#   make dynamic        # build come modulo dinamico (.so)
-#   make test           # smoke test end-to-end con due backend fittizi
-#   make install        # installa (default /usr/local/nginx) - richiede root
-#   make clean          # pulizia
+# Typical usage:
+#   make                # build the dynamic module (.so) and copy it to dist/
+#   make test           # end-to-end test suite against dist/'s .so
+#   make clean          # clean nginx source build objects and test certs
+#   make distclean      # remove build/ and dist/ entirely
 #
-# Variabili sovrascrivibili:
-#   make NGINX_VERSION=1.27.4
-#   make CONFIGURE_OPTS="--with-http_ssl_module"
-#   make NGINX_SRC=/path/al/sorgente/nginx    # usa un sorgente già presente
+# Version and configure options are auto-detected from `nginx -V` (the
+# nginx already installed on the system, however it got there: apt, dnf,
+# brew, a manual build, a Docker image), so the same command works
+# identically on Ubuntu, RHEL, macOS or in a container without having to
+# guess the version or compiled-in features by hand. The nginx source is
+# still required to build (no packaging system ships nginx's internal
+# headers as a separate package: that's not a limitation of this Makefile,
+# it's true for any nginx module, third-party or official) and is
+# downloaded once into build/ — subsequent builds reuse it without
+# touching the network.
+#
+# Overridable variables:
+#   make NGINX_BIN=/usr/sbin/nginx             # which installed nginx to detect
+#   make NGINX_VERSION=1.27.4                  # force the version (skip detection)
+#   make CONFIGURE_OPTS="--with-http_ssl_module"   # force the options (skip detection)
+#   make NGINX_SRC=/path/to/nginx/source       # use an already-present source
+#                                               # (e.g. an existing from-source
+#                                               # install): nothing gets downloaded
 
-NGINX_VERSION  ?= 1.26.2
+# Directory this Makefile lives in (not necessarily the cwd "make" was
+# invoked from), so its own scripts can be found regardless of where the
+# build is launched from.
+MK_DIR                 := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+NGINX_BIN              ?= nginx
+NGINX_DETECTED_VERSION := $(shell $(NGINX_BIN) -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+# Options detected from "nginx -V", filtered by detect-nginx-opts.sh to keep
+# only the ones vanilla nginx.org's ./configure recognizes: distros (e.g.
+# Debian/Ubuntu) often patch their own configure with extra packaging
+# options (--override-system=, a --build= used in non-standard ways, etc.)
+# that the official configure doesn't understand and would fail on with
+# "invalid option" if replayed verbatim.
+NGINX_DETECTED_ARGS    := $(shell $(MK_DIR)detect-nginx-opts.sh $(NGINX_BIN))
+
+NGINX_VERSION  ?= $(if $(NGINX_DETECTED_VERSION),$(NGINX_DETECTED_VERSION),1.26.2)
 NGINX_TARBALL  := nginx-$(NGINX_VERSION).tar.gz
 NGINX_URL      := https://nginx.org/download/$(NGINX_TARBALL)
 NGINX_URL_GH   := https://github.com/nginx/nginx/archive/refs/tags/release-$(NGINX_VERSION).tar.gz
 
 MODULE_DIR     := $(abspath .)
 BUILD_DIR      := $(MODULE_DIR)/build
+DIST_DIR       := $(MODULE_DIR)/dist
 NGINX_SRC      ?= $(BUILD_DIR)/nginx-$(NGINX_VERSION)
 
-# Il configure script si chiama ./configure nel tarball ufficiale
-# e auto/configure nel tree GitHub: li gestiamo entrambi.
+# The configure script is called ./configure in the official tarball and
+# auto/configure in the GitHub tree: handle both.
 CONFIGURE       = $(shell test -x $(NGINX_SRC)/configure && echo ./configure || echo auto/configure)
 
-CONFIGURE_OPTS ?= --with-http_ssl_module
+# The same options the installed nginx was built with (detected from
+# "nginx -V"), plus --with-compat which guarantees the module is loadable
+# even if it doesn't replicate every single option exactly. If nginx isn't
+# found in PATH, a reasonable minimal fallback (CC_OPT is included here
+# because, when options are detected, their own --with-cc-opt replaces
+# ours instead of merging with it: nginx only keeps the last occurrence of
+# a repeated option. It isn't actually needed in that case: nginx's default
+# CFLAGS already include -Wno-unused-parameter).
 CC_OPT         ?= -Wno-unused-parameter
+CONFIGURE_OPTS ?= $(if $(NGINX_DETECTED_ARGS),$(NGINX_DETECTED_ARGS) --with-compat,--with-http_ssl_module --with-cc-opt="$(CC_OPT)" --with-compat)
 
-MODULE_SRCS    := config ngx_http_upstream_healthcheck_module.c
+MODULE_SRCS    := config \
+                  include/ngx_http_upstream_healthcheck_module.h \
+                  src/ngx_http_upstream_healthcheck_module.c \
+                  src/ngx_http_hc_upstream.c \
+                  src/ngx_http_hc_balancer.c \
+                  src/ngx_http_hc_probe.c \
+                  src/ngx_http_hc_resolve.c \
+                  src/ngx_http_hc_status.c
 
-.PHONY: all static dynamic test install clean distclean help
+.PHONY: all dynamic test clean distclean help
 
-all: static
+all: dynamic
 
-# ------------------------------------------------------------ sorgente nginx
+# ---------------------------------------------------------- nginx source
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(NGINX_SRC)/.downloaded: | $(BUILD_DIR)
 	@if [ ! -d "$(NGINX_SRC)" ]; then \
-	    echo ">> Scarico nginx $(NGINX_VERSION)"; \
+	    echo ">> Fetching nginx $(NGINX_VERSION)"; \
 	    ( curl -fsSL -o $(BUILD_DIR)/$(NGINX_TARBALL) $(NGINX_URL) \
 	      && tar -xzf $(BUILD_DIR)/$(NGINX_TARBALL) -C $(BUILD_DIR) ) \
-	    || ( echo ">> nginx.org non raggiungibile, provo GitHub"; \
+	    || ( echo ">> nginx.org unreachable, trying GitHub"; \
 	         curl -fsSL -o $(BUILD_DIR)/$(NGINX_TARBALL) $(NGINX_URL_GH) \
 	         && tar -xzf $(BUILD_DIR)/$(NGINX_TARBALL) -C $(BUILD_DIR) \
 	         && mv $(BUILD_DIR)/nginx-release-$(NGINX_VERSION) $(NGINX_SRC) ); \
 	fi
 	touch $@
 
-# ------------------------------------------------------------- build statica
-
-static: $(NGINX_SRC)/.downloaded $(MODULE_SRCS)
-	cd $(NGINX_SRC) && $(CONFIGURE) \
-	    --with-cc-opt="$(CC_OPT)" \
-	    --add-module=$(MODULE_DIR) \
-	    $(CONFIGURE_OPTS)
-	$(MAKE) -C $(NGINX_SRC)
-	@echo
-	@echo ">> Binario: $(NGINX_SRC)/objs/nginx"
-	@$(NGINX_SRC)/objs/nginx -V 2>&1 | head -2
-
-# ------------------------------------------------------------ build dinamica
+# -------------------------------------------------------- dynamic build
 
 dynamic: $(NGINX_SRC)/.downloaded $(MODULE_SRCS)
 	cd $(NGINX_SRC) && $(CONFIGURE) \
-	    --with-cc-opt="$(CC_OPT)" \
 	    --add-dynamic-module=$(MODULE_DIR) \
 	    $(CONFIGURE_OPTS)
 	$(MAKE) -C $(NGINX_SRC) modules
+	mkdir -p $(DIST_DIR)
+	cp $(NGINX_SRC)/objs/ngx_http_upstream_healthcheck_module.so $(DIST_DIR)/
 	@echo
-	@echo ">> Modulo: $(NGINX_SRC)/objs/ngx_http_upstream_healthcheck_module.so"
-	@echo ">> Caricalo in nginx.conf con:"
-	@echo ">>   load_module modules/ngx_http_upstream_healthcheck_module.so;"
+	@echo ">> Module: $(DIST_DIR)/ngx_http_upstream_healthcheck_module.so"
+	@echo ">> Load it in nginx.conf with:"
+	@echo ">>   load_module $(DIST_DIR)/ngx_http_upstream_healthcheck_module.so;"
 
-# ------------------------------------------------------------------- install
+# ---------------------------------------------------------- smoke test
 
-install: static
-	$(MAKE) -C $(NGINX_SRC) install
+TEST_DIR := $(MODULE_DIR)/test
 
-# ---------------------------------------------------------------- smoke test
+test: dynamic
+	@if [ ! -f $(TEST_DIR)/cert.pem ] || [ ! -f $(TEST_DIR)/key.pem ]; then \
+	    echo ">> Generating test TLS certificate ($(TEST_DIR)/cert.pem, key.pem)"; \
+	    openssl req -x509 -newkey rsa:2048 \
+	        -keyout $(TEST_DIR)/key.pem -out $(TEST_DIR)/cert.pem \
+	        -days 30 -nodes -subj "/CN=backend.internal" 2>/dev/null; \
+	fi
+	python3 $(TEST_DIR)/test_healthcheck.py
 
-TEST_DIR := $(BUILD_DIR)/test
-
-test: static
-	@mkdir -p $(TEST_DIR)/logs
-	@printf '%s\n' \
-	  'worker_processes 2;' \
-	  'error_log $(TEST_DIR)/logs/error.log info;' \
-	  'pid $(TEST_DIR)/nginx.pid;' \
-	  'events { worker_connections 128; }' \
-	  'http {' \
-	  '    access_log off;' \
-	  '    upstream backend {' \
-	  '        server 127.0.0.1:9001;' \
-	  '        server 127.0.0.1:9002;' \
-	  '        healthcheck interval=1000 timeout=500 fall=2 rise=2 uri=/;' \
-	  '    }' \
-	  '    server {' \
-	  '        listen 127.0.0.1:8888;' \
-	  '        location / { proxy_pass http://backend; }' \
-	  '        location /hc-status { healthcheck_status; }' \
-	  '    }' \
-	  '}' > $(TEST_DIR)/nginx.conf
-	@echo ">> Avvio due backend di test (9001, 9002)"
-	@python3 -m http.server 9001 --bind 127.0.0.1 >/dev/null 2>&1 & echo $$! > $(TEST_DIR)/b1.pid
-	@python3 -m http.server 9002 --bind 127.0.0.1 >/dev/null 2>&1 & echo $$! > $(TEST_DIR)/b2.pid
-	@sleep 1
-	@$(NGINX_SRC)/objs/nginx -c $(TEST_DIR)/nginx.conf -p $(TEST_DIR)/
-	@sleep 3
-	@echo ">> Stato iniziale (entrambi up):"
-	@curl -s http://127.0.0.1:8888/hc-status
-	@echo ">> Fermo il backend 9002..."
-	@kill `cat $(TEST_DIR)/b2.pid` 2>/dev/null || true
-	@sleep 4
-	@echo ">> Stato dopo il kill (9002 deve essere DOWN):"
-	@curl -s http://127.0.0.1:8888/hc-status
-	@echo ">> Verifica failover: la richiesta deve rispondere 200 da 9001"
-	@curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8888/
-	@$(MAKE) --no-print-directory test-clean
-	@echo ">> Test OK"
-
-test-clean:
-	-@$(NGINX_SRC)/objs/nginx -c $(TEST_DIR)/nginx.conf -p $(TEST_DIR)/ -s stop 2>/dev/null
-	-@kill `cat $(TEST_DIR)/b1.pid` 2>/dev/null
-	-@kill `cat $(TEST_DIR)/b2.pid` 2>/dev/null
-	-@rm -f $(TEST_DIR)/b1.pid $(TEST_DIR)/b2.pid
-
-# ----------------------------------------------------------------- pulizia
+# --------------------------------------------------------------- clean
 
 clean:
 	-$(MAKE) -C $(NGINX_SRC) clean 2>/dev/null || true
+	rm -f $(TEST_DIR)/cert.pem $(TEST_DIR)/key.pem
+	rm -rf $(TEST_DIR)/__pycache__
 
-distclean:
-	rm -rf $(BUILD_DIR)
+distclean: clean
+	rm -rf $(BUILD_DIR) $(DIST_DIR)
 
 help:
-	@echo "Target disponibili:"
-	@echo "  make [static]   build statica del binario nginx con il modulo"
-	@echo "  make dynamic    build del solo modulo dinamico (.so)"
-	@echo "  make test       smoke test end-to-end (richiede python3 e curl)"
-	@echo "  make install    installa nginx compilato (richiede root)"
-	@echo "  make clean      pulisce gli oggetti di build"
-	@echo "  make distclean  rimuove build/ (sorgente nginx incluso)"
+	@echo "Available targets:"
+	@echo "  make [dynamic]  build the dynamic module (.so) and copy it to dist/"
+	@echo "  make test       end-to-end test suite (requires python3 and openssl)"
+	@echo "  make clean      clean nginx source build objects and test certs"
+	@echo "  make distclean  remove build/ and dist/ entirely"
 	@echo
-	@echo "Variabili: NGINX_VERSION, NGINX_SRC, CONFIGURE_OPTS, CC_OPT"
+	@echo "Variables: NGINX_VERSION, NGINX_SRC, CONFIGURE_OPTS, CC_OPT"
