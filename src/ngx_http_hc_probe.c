@@ -11,6 +11,8 @@
 static void ngx_http_hc_begin_check(ngx_event_t *ev);
 static ngx_int_t ngx_http_hc_dummy_get_peer(ngx_peer_connection_t *pc,
     void *data);
+static u_char *ngx_http_hc_log_error(ngx_log_t *log, u_char *buf,
+    size_t len);
 #if (NGX_SSL)
 static void ngx_http_hc_ssl_handshake_start(ngx_event_t *ev);
 static void ngx_http_hc_ssl_handshake_done(ngx_connection_t *c);
@@ -50,9 +52,21 @@ ngx_http_hc_init_process(ngx_cycle_t *cycle)
     peers = hmcf->peers.elts;
 
     for (i = 0; i < hmcf->peers.nelts; i++) {
+
+        /*
+         * a peer-private copy of cycle->log (same file/level), with
+         * handler/data set so every message logged through it — timers,
+         * the probe connection, SSL, DNS resolution — gets this peer's
+         * identity appended. See ngx_http_hc_log_error(); must be a copy,
+         * not cycle->log itself, since that object is shared process-wide.
+         */
+        peers[i].log          = *cycle->log;
+        peers[i].log.handler  = ngx_http_hc_log_error;
+        peers[i].log.data     = &peers[i];
+
         peers[i].check_ev.handler = ngx_http_hc_begin_check;
         peers[i].check_ev.data    = &peers[i];
-        peers[i].check_ev.log     = cycle->log;
+        peers[i].check_ev.log     = &peers[i].log;
 
         /* spread the first probes over the interval */
         ngx_add_timer(&peers[i].check_ev,
@@ -61,7 +75,7 @@ ngx_http_hc_init_process(ngx_cycle_t *cycle)
         if (peers[i].hostname.len) {
             peers[i].resolve_ev.handler = ngx_http_hc_resolve_begin;
             peers[i].resolve_ev.data    = &peers[i];
-            peers[i].resolve_ev.log     = cycle->log;
+            peers[i].resolve_ev.log     = &peers[i].log;
 
             ngx_add_timer(&peers[i].resolve_ev,
                           ngx_random() % peers[i].conf->resolve_interval + 1);
@@ -76,6 +90,34 @@ static ngx_int_t
 ngx_http_hc_dummy_get_peer(ngx_peer_connection_t *pc, void *data)
 {
     return NGX_OK;
+}
+
+
+/*
+ * Appended by nginx's own logging core to every message logged through a
+ * probe connection's log (log->handler is invoked automatically, the same
+ * mechanism proxy_pass uses to append "client: ..., server: ..., upstream:
+ * ..." to its own errors). Without this, low-level failures like a plain
+ * "recv() failed (110: Connection timed out)" give no clue which peer they
+ * came from.
+ */
+static u_char *
+ngx_http_hc_log_error(ngx_log_t *log, u_char *buf, size_t len)
+{
+    ngx_http_hc_peer_t  *peer;
+    u_char               *p;
+
+    peer = log->data;
+    if (peer == NULL) {
+        return buf;
+    }
+
+    p = ngx_snprintf(buf, len, ", healthcheck peer: %V (upstream \"%V\")",
+                     &peer->name, &peer->upstream);
+    len -= p - buf;
+    buf = p;
+
+    return buf;
 }
 
 
@@ -268,7 +310,9 @@ ngx_http_hc_ssl_handshake_done(ngx_connection_t *c)
 
     if (peer->conf->ssl_verify) {
         if (SSL_get_verify_result(c->ssl->connection) != X509_V_OK) {
-            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+            /* ngx_cycle->log, not c->log: this message already spells
+             * out the peer identity itself */
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
                 "healthcheck: invalid TLS certificate for %V (%V)",
                 &peer->name, &peer->upstream);
             ngx_http_hc_finish_check(peer, 0);
@@ -283,7 +327,7 @@ ngx_http_hc_ssl_handshake_done(ngx_connection_t *c)
         if (peer->conf->ssl_name.len
             && ngx_ssl_check_host(c, &peer->conf->ssl_name) != NGX_OK)
         {
-            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
                 "healthcheck: the TLS certificate of %V (%V) doesn't "
                 "cover hostname \"%V\"",
                 &peer->name, &peer->upstream, &peer->conf->ssl_name);
@@ -774,7 +818,10 @@ ngx_http_hc_finish_check(ngx_http_hc_peer_t *peer, ngx_int_t success)
                 shm->rise_count  = 0;
                 shm->last_change = ngx_time();
 
-                ngx_log_error(NGX_LOG_WARN, peer->check_ev.log, 0,
+                /* ngx_cycle->log, not peer->check_ev.log: this message
+                 * already spells out the peer identity itself, no need
+                 * for ngx_http_hc_log_error() to append it again */
+                ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
                               "healthcheck: peer %V (%V) is UP",
                               &peer->name, &peer->upstream);
             }
@@ -792,7 +839,7 @@ ngx_http_hc_finish_check(ngx_http_hc_peer_t *peer, ngx_int_t success)
                 shm->fall_count  = 0;
                 shm->last_change = ngx_time();
 
-                ngx_log_error(NGX_LOG_WARN, peer->check_ev.log, 0,
+                ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
                               "healthcheck: peer %V (%V) is DOWN",
                               &peer->name, &peer->upstream);
             }

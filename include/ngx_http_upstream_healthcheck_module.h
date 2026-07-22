@@ -93,6 +93,17 @@ typedef struct {
     ngx_event_t                         resolve_ev; /* periodic re-resolve */
     ngx_resolver_ctx_t                 *resolve_ctx;
 
+    /*
+     * a private copy of cycle->log with .handler/.data set to this peer,
+     * so every message logged through the probe connection (including
+     * low-level ones like "recv() failed" that know nothing about us)
+     * gets this peer's identity appended — see ngx_http_hc_log_error().
+     * Must NOT just point at cycle->log directly: that object is shared
+     * by the whole process, and every peer would stomp on each other's
+     * handler/data.
+     */
+    ngx_log_t                           log;
+
     ngx_event_t                         check_ev;   /* periodic timer      */
     ngx_peer_connection_t               pc;
     ngx_buf_t                          *request;
