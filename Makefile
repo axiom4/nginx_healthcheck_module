@@ -73,6 +73,7 @@ CONFIGURE_OPTS ?= $(if $(NGINX_DETECTED_ARGS),$(NGINX_DETECTED_ARGS) --with-comp
 MODULE_SRCS    := config \
                   include/ngx_http_upstream_healthcheck_module.h \
                   src/ngx_http_upstream_healthcheck_module.c \
+                  src/ngx_http_hc_config.c \
                   src/ngx_http_hc_upstream.c \
                   src/ngx_http_hc_balancer.c \
                   src/ngx_http_hc_probe.c \

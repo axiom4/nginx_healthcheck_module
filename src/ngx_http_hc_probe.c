@@ -390,7 +390,7 @@ static u_char *
 ngx_http_hc_find_header(u_char *start, u_char *end, const char *name)
 {
     size_t   len = ngx_strlen(name);
-    u_char  *p;
+    u_char  *p, *value;
 
     if ((size_t) (end - start) < len) {
         return NULL;
@@ -400,11 +400,11 @@ ngx_http_hc_find_header(u_char *start, u_char *end, const char *name)
         if ((p == start || p[-1] == '\n')
             && ngx_strncasecmp(p, (u_char *) name, len) == 0)
         {
-            p += len;
-            while (p < end && *p == ' ') {
-                p++;
+            value = p + len;
+            while (value < end && *value == ' ') {
+                value++;
             }
-            return p;
+            return value;
         }
     }
 

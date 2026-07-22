@@ -145,6 +145,13 @@ extern ngx_module_t ngx_http_upstream_healthcheck_module;
 
 /* ------------------------------------------------ cross-file prototypes */
 
+/* ngx_http_hc_config.c */
+char *ngx_http_hc_healthcheck(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *ngx_http_hc_status(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *ngx_http_hc_shm_size(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *ngx_http_hc_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *ngx_http_hc_match_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
 /* ngx_http_hc_upstream.c */
 ngx_int_t ngx_http_hc_init_upstream(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us);

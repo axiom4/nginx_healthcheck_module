@@ -1,6 +1,7 @@
 ngx_addon_name=ngx_http_upstream_healthcheck_module
 
 ngx_hc_srcs="$ngx_addon_dir/src/ngx_http_upstream_healthcheck_module.c \
+             $ngx_addon_dir/src/ngx_http_hc_config.c \
              $ngx_addon_dir/src/ngx_http_hc_upstream.c \
              $ngx_addon_dir/src/ngx_http_hc_balancer.c \
              $ngx_addon_dir/src/ngx_http_hc_probe.c \

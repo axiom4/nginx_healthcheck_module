@@ -6,3 +6,4 @@ test/proxy_temp/
 test/tmp/
 dist
 __pycache__
+*.pem
