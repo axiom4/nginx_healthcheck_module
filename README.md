@@ -197,6 +197,18 @@ http {
 
 ### TLS health check to backends
 
+> **Security note:** `ssl_verify` defaults to `off`, so by default the probe
+> accepts *any* certificate the backend presents — an attacker on-path
+> between nginx and the backend can complete the handshake and forge probe
+> responses, flipping a compromised or malicious endpoint to UP (or a
+> legitimate one to DOWN). This only affects the health-check liveness
+> signal, not the proxied data path (`proxy_pass` has its own, separately
+> configured `proxy_ssl_verify`), but for anything beyond a trusted private
+> network you should set `ssl_verify=on` together with
+> `ssl_trusted_certificate=` **and** `ssl_name=` — verification without
+> `ssl_name=` checks the certificate chain but not the hostname, so it does
+> not authenticate *which* peer you're talking to.
+
 ```nginx
 upstream backend {
     server 10.0.0.1:8443;
@@ -208,7 +220,8 @@ upstream backend {
 }
 ```
 
-With certificate verification:
+With certificate verification (recommended whenever the backend isn't on a
+fully trusted private network):
 
 ```nginx
 healthcheck interval=5000 fall=3 rise=2 uri=/health
@@ -285,7 +298,7 @@ server {
 | `resolve`                      | off     | periodically re-resolves via DNS peers configured with a hostname (see below) |
 | `resolve_interval=`            | 30000   | ms between one re-resolution and the next (only with `resolve`) |
 | `ssl`                          | off     | runs the probe over a TLS connection (requires `--with-http_ssl_module`) |
-| `ssl_verify=on\|off`           | off     | verifies the backend's certificate                               |
+| `ssl_verify=on\|off`           | off     | verifies the backend's certificate (see security note above — default `off` trusts any cert) |
 | `ssl_name=`                    | —       | SNI / hostname sent in the ClientHello, and the hostname expected during certificate verification when `ssl_verify=on` |
 | `ssl_trusted_certificate=`     | —       | path to the CA file for `ssl_verify=on`                          |
 

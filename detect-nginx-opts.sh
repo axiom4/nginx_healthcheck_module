@@ -29,14 +29,19 @@ if [ -z "$raw" ]; then
     exit 0
 fi
 
-# eval+set-- reconstructs the original argument array respecting the
-# quoting "nginx -V" printed them with (the same technique the distro used
-# to pass them to configure in the first place).
-eval "set -- $raw"
+# Reconstruct the original argument array respecting the quoting "nginx -V"
+# printed them with, without ever evaluating "$raw" as shell code: xargs
+# tokenizes shell-style quoting/escaping but performs no command
+# substitution, so an nginx binary with an attacker-crafted configure
+# string can't execute code at build time here.
+args=()
+while IFS= read -r arg; do
+    args+=("$arg")
+done < <(xargs -n1 <<<"$raw")
 
 out=()
 
-for arg in "$@"; do
+for arg in "${args[@]}"; do
     case "$arg" in
         --with-*|--without-*| \
         --add-module=*|--add-dynamic-module=*| \
