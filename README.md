@@ -217,6 +217,34 @@ healthcheck interval=5000 fall=3 rise=2 uri=/health
             ssl_name=backend.internal.example.com;
 ```
 
+### Fallback to an always-on backup server
+
+If every monitored peer goes DOWN, you may want traffic to land somewhere
+useful (a static maintenance page, a status service) instead of a bare 502.
+No feature of this module is needed for that — plain nginx already does it
+via the standard `backup` parameter on `server`:
+
+```nginx
+upstream backend {
+    server 10.0.0.1:8443;
+    server 10.0.0.2:8443;
+    healthcheck interval=5000 timeout=2000 fall=3 rise=2 uri=/health;
+
+    server 127.0.0.1:9099 backup;   # serves a static maintenance page
+}
+```
+
+This works because `healthcheck` only ever probes and marks DOWN the peers
+it's told to watch — a `server ... backup;` line with no `healthcheck`
+directive above it is invisible to this module's shared-memory state, so it
+always reads as "not down". nginx's own round-robin balancer already treats
+`backup` peers as a last resort, used only once every non-backup peer in the
+upstream has been tried and failed — that fail-over logic runs regardless of
+*why* the primaries were skipped (a real connection failure, or this module
+marking them DOWN ahead of time), so it fires exactly when you'd want it to.
+The client gets a normal `200` with the backup server's response body — no
+redirect, no `error_page` needed.
+
 ### Everything together
 
 ```nginx
